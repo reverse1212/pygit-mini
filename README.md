@@ -33,7 +33,18 @@ pygit init
 | `pygit clone <origen> <destino>` | Clona un repositorio local (objetos+refs+worktree) |
 | `pygit fetch <remoto>` | Copia objetos y refs de otro repo local a `refs/remotes/<nombre>` |
 | `pygit push <remoto> [rama]` | Empuja commits a otro repo local (fast-forward) |
+| `pygit pull <remoto> [rama]` | Fetch + merge: fast-forward o commit de fusión |
 | `pygit rm` | Borra del disco y del index |
+
+## Flujo distribuido entre repos locales
+
+```bash
+pygit clone ../origen copia          # objetos + refs + working tree
+pygit commit -m "avance"             # trabajo en la copia
+pygit push ../origen                # empuja al origen (fast-forward)
+pygit pull ../origen                # trae cambios (FF o merge)
+pygit fetch ../origen               # solo objetos + refs/remotes/
+```
 
 ## Interoperabilidad con git
 
