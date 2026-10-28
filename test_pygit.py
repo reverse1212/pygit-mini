@@ -264,6 +264,55 @@ def test_tag_duplicado_falla(repo):
     assert proc.returncode != 0
 
 
+# --- tag -d / branch -a / clone ---
+
+def test_tag_delete(repo):
+    write(repo, "a.txt", "1")
+    run(repo, "add", "a.txt")
+    run(repo, "commit", "-m", "base")
+    run(repo, "tag", "v1")
+    run(repo, "tag", "-d", "v1")
+    out = run(repo, "tag").stdout
+    assert "v1" not in out
+
+
+def test_branch_all_muestra_tags(repo):
+    write(repo, "a.txt", "1")
+    run(repo, "add", "a.txt")
+    run(repo, "commit", "-m", "base")
+    run(repo, "tag", "-a", "v1", "-m", "msg")
+    out = run(repo, "branch", "-a").stdout
+    assert "tags/v1" in out
+
+
+def test_clone_local(repo, tmp_path):
+    """Un clone copia objetos, refs, HEAD y materializa el working tree."""
+    import os as _os
+
+    write(repo, "base.txt", "contenido original")
+    run(repo, "add", "base.txt")
+    run(repo, "commit", "-m", "base en t8")
+    run(repo, "tag", "-a", "v1", "-m", "tag del origen")
+
+    dest = _os.path.join(str(tmp_path), "clone-de-prueba")
+    run(repo, "clone", repo, dest)   # source y target absolutos
+
+    read = lambda name: open(
+        _os.path.join(dest, name), encoding="utf-8").read()
+    assert read("base.txt") == "contenido original"
+    # log de pygit en el clon muestra el commit
+    out = run(dest, "log").stdout
+    assert "base en t8" in out
+    # y el tag anotado importado
+    out = run(dest, "tag").stdout
+    assert "v1 (anotado)" in out
+    # git real ve el commit clonado
+    proc = subprocess.run(
+        ["git", "log", "--oneline"], cwd=dest, capture_output=True, text=True
+    )
+    assert "base en t8" in proc.stdout
+
+
 # --- rm / diff ---
 
 def test_rm_borra_del_index_y_disco(repo):

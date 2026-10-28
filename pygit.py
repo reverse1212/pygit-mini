@@ -12,6 +12,7 @@ import difflib
 import hashlib
 import heapq
 import os
+import shutil
 import sys
 import time
 import zlib
@@ -592,6 +593,73 @@ def tag_list(repo):
             print(f"{name} -> {sha[:7]}")
 
 
+def tag_delete(repo, name):
+    """Borra la ref refs/tags/<name>."""
+    path = repo_dir(repo, "refs", "tags", name)
+    if not os.path.exists(path):
+        print(f"ERROR: el tag '{name}' no existe")
+        sys.exit(1)
+    os.remove(path)
+    print(f"Tag '{name}' borrado")
+
+
+# --- Clone local (fase 9) ---
+
+def clone(source, target):
+    """Clona un repositorio local pygit/git a un directorio nuevo.
+
+    Copia los objetos, refs y HEAD; materializa el working tree y el index.
+    """
+    src_git = os.path.join(source, ".git")
+    if not os.path.isdir(src_git):
+        print(f"ERROR: '{source}' no es un repositorio pygit/git")
+        sys.exit(1)
+    if os.path.exists(target):
+        print(f"ERROR: el directorio destino '{target}' ya existe")
+        sys.exit(1)
+
+    repo_init(target)
+    dst_objects = repo_dir(target, "objects")
+
+    # Copia el árbol completo de objetos preservando la estructura sha-prefix
+    for root, dirs, files in os.walk(os.path.join(src_git, "objects")):
+        rel = os.path.relpath(root, os.path.join(src_git, "objects"))
+        for fn in files:
+            dst_dir = os.path.join(dst_objects, rel)
+            os.makedirs(dst_dir, exist_ok=True)
+            shutil.copy2(os.path.join(root, fn), os.path.join(dst_dir, fn))
+
+    # Ramas y tags desde las refs de origen
+    imported = 0
+    for kind in ("heads", "tags"):
+        src_refs = os.path.join(src_git, "refs", kind)
+        if os.path.isdir(src_refs):
+            dst_refs = repo_dir(target, "refs", kind)
+            os.makedirs(dst_refs, exist_ok=True)
+            for root, dirs, files in os.walk(src_refs):
+                rel = os.path.relpath(root, src_refs)
+                for fn in files:
+                    name = fn if rel == "." else f"{rel}\\{fn}".replace("\\x00", "/")
+                    name = (fn if rel == "." else os.path.join(rel, fn))
+                    dst = os.path.join(dst_refs, name)
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    shutil.copy2(os.path.join(root, fn), dst)
+                    imported += 1
+
+    # HEAD: usa la rama por defecto del origen
+    with open(os.path.join(src_git, "HEAD")) as f:
+        head_ref = f.read().strip()
+    with open(repo_dir(target, "HEAD"), "w", newline="\n") as f:
+        f.write(head_ref + "\n")
+
+    # Materializa el working tree y el index de la rama por defecto
+    branch = head_ref.split("refs/heads/", 1)[-1]
+    head_sha_file = repo_dir(target, "refs", "heads", branch)
+    if os.path.exists(head_sha_file):
+        checkout(target, branch)
+    print(f"Clonado {source} -> {target} ({imported} refs)")
+
+
 # --- Merge de líneas, 3-way real (fase 5) ---
 
 def sync_regions(base, ours, theirs):
@@ -764,14 +832,20 @@ def _print_diff(path, old_data, new_data):
         sys.stdout.write(line if line.endswith("\n") else line + "\n")
 
 
-def branch_list(repo):
-    """Lista las ramas; marca la actual con '* '."""
+def branch_list(repo, all_refs=False):
+    """Lista las ramas (y con -a también las remotas... y refs/tags); marca la actual."""
     current = read_ref(repo)
     heads = repo_dir(repo, "refs", "heads")
     if os.path.isdir(heads):
         for name in sorted(os.listdir(heads)):
             marker = "*" if name == current else " "
             print(f"{marker} {name}")
+    if all_refs:
+        tags_dir = repo_dir(repo, "refs", "tags")
+        if os.path.isdir(tags_dir):
+            print("\nTags:")
+            for name in sorted(os.listdir(tags_dir)):
+                print(f"  tags/{name}")
 
 
 def branch_delete(repo, name):
@@ -848,13 +922,20 @@ def main(argv=sys.argv[1:]):
 
     p_branch = sub.add_parser("branch", help="Lista las ramas")
     p_branch.add_argument("-d", "--delete", metavar="RAMA", help="Borra la rama")
+    p_branch.add_argument("-a", "--all", action="store_true",
+                          help="Lista también los tags")
 
     p_tag = sub.add_parser("tag", help="Lista tags (o crea con -a/-l)")
     p_tag.add_argument("name", nargs="?", help="Nombre del tag a crear")
     p_tag.add_argument("-a", "--annotate", action="store_true", help="Tag anotado")
     p_tag.add_argument("-m", "--message", help="Mensaje del tag anotado")
+    p_tag.add_argument("-d", "--delete", help="Borra el tag")
     p_tag.add_argument("target", nargs="?", default=None,
                        help="Commit/rama destino (tag ligero)")
+
+    p_clone = sub.add_parser("clone", help="Clona un repositorio local")
+    p_clone.add_argument("source")
+    p_clone.add_argument("target")
 
     args = parser.parse_args(argv)
 
@@ -894,15 +975,19 @@ def main(argv=sys.argv[1:]):
         if args.delete:
             branch_delete(".", args.delete)
         else:
-            branch_list(".")
+            branch_list(".", all_refs=args.all)
     elif args.command == "tag":
-        if args.name:
+        if args.name and not args.delete:
             if args.annotate or args.message:
                 tag_annotate(".", args.name, args.message or f"Tag {args.name}")
             else:
                 tag_lightweight(".", args.name, args.target)
+        elif args.delete:
+            tag_delete(".", args.delete)
         else:
             tag_list(".")
+    elif args.command == "clone":
+        clone(args.source, args.target)
     else:
         parser.error(f"Comando desconocido: {args.command}")
 
