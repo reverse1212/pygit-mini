@@ -122,7 +122,7 @@ def index_is_dirty(repo):
 def commit(repo, message):
     """Crea blobs para los archivos del index/workdir, un tree y un commit."""
     # Blobs del working tree (autor ya apareció en write_object vía index)
-    entries = []
+    entries = {}
     for root, _, filenames in os.walk(repo):
         if ".git" in root.split(os.sep):
             continue
@@ -131,15 +131,11 @@ def commit(repo, message):
             path = fn if root_rel == "." else f"{root_rel}/{fn}"
             with open(os.path.join(root, fn), "rb") as f:
                 sha = write_object(repo, f.read(), OBJ_BLOB)
-            entries.append((path, sha))
-    index_write(repo, entries)
+            entries[path] = sha
+    index_write(repo, entries.items())
 
-    # Tree en formato real de git: "<mode> <nombre>\0<sha1 binario>", por nombre
-    tree_items = []
-    for path, sha in sorted(entries, key=lambda e: os.path.basename(e[0])):
-        name = os.path.basename(path)
-        tree_items.append(b"100644 " + name.encode() + b"\x00" + bytes.fromhex(sha))
-    tree_sha = write_object(repo, b"".join(tree_items), OBJ_TREE)
+    # Tree construido recursivamente: los subdirectorios son trees anidados
+    tree_sha = build_tree(repo, entries)
 
     # Commit: árbol + padre (si hay) + mensaje
     head = commit_head(repo)
@@ -175,6 +171,172 @@ def commit_head(repo):
         return None
     with open(ref_path) as f:
         return f.read().strip()
+
+
+# --- Rama actual (fase 3) ---
+
+def read_ref(repo):
+    """Devuelve el nombre de la rama actual (p.ej. 'master')."""
+    with open(repo_dir(repo, "HEAD")) as f:
+        ref = f.read().strip().split(" ")[-1]
+    return ref[len("refs/heads/"):]
+
+
+def set_head_branch(repo, branch):
+    """Hace que HEAD apunte a refs/heads/<branch>."""
+    with open(repo_dir(repo, "HEAD"), "w", newline="\n") as f:
+        f.write(f"ref: refs/heads/{branch}\n")
+
+
+def branch_write(repo, branch, sha):
+    """Crea o actualiza refs/heads/<branch>."""
+    path = repo_dir(repo, "refs", "heads", branch)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="\n") as f:
+        f.write(sha + "\n")
+
+
+# --- Trees, recursivos (fase 3) ---
+
+def build_tree(repo, entries):
+    """Construye trees anidados a partir de {path: sha} y devuelve el tree raíz."""
+    dirs = {}       # nombre -> subconjunto de {path relativo: sha}
+    files = []
+    for path, sha in sorted(entries.items()):
+        head, _, tail = path.partition("/")
+        if tail:
+            dirs.setdefault(head, {})[tail] = sha
+        else:
+            files.append((head, sha))
+    items = [
+        (b"40000", mi_dir, bytes.fromhex(build_tree(repo, sub)))
+        for mi_dir, sub in sorted(dirs.items())
+    ] + [(b"100644", name, bytes.fromhex(sha)) for name, sha in sorted(files)]
+    items.sort(key=lambda item: item[1])
+    data = b"".join(
+        mode + b" " + name.encode() + b"\x00" + sha for mode, name, sha in items
+    )
+    return write_object(repo, data, OBJ_TREE)
+
+
+def tree_read(repo, sha):
+    """Parsea un tree binario: lista de (mode, type, item_sha, name)."""
+    items = []
+    try:
+        obj_type, data = read_object(repo, sha)
+    except FileNotFoundError:
+        raise Exception(f"Árbol {sha} no encontrado")
+    pos = 0
+    while pos < len(data):
+        nul = data.index(b"\x00", pos)
+        mode_name = data[pos:nul].decode()
+        mode, name = mode_name.split(" ")
+        item_sha = data[nul + 1:nul + 21].hex()
+        obj_type = OBJ_TREE if mode == "40000" else OBJ_BLOB
+        items.append((mode, obj_type, item_sha, name))
+        pos = nul + 21
+    return items
+
+
+def get_index_tree(repo):
+    """Devuelve {path: sha} con todos los archivos del tree del commit HEAD."""
+    index = {}
+    if not commit_head(repo):
+        return index
+    _, data = read_object(repo, commit_head(repo))
+    tree_sha = data.split(b"\n")[0].split(b" ")[1].decode()
+
+    def walk(sha, prefix):
+        for mode, obj_type, item_sha, name in tree_read(repo, sha):
+            path = f"{prefix}{name}"
+            if obj_type == OBJ_TREE:
+                walk(item_sha, path + "/")
+            else:
+                index[path] = item_sha
+
+    walk(tree_sha, "")
+    return index
+
+
+# --- Status (fase 3) ---
+
+def get_status(repo):
+    """Compara HEAD <- pygit-index <- working tree.
+
+    Devuelve (add, delete, modified):
+    - add:      en index/HEAD pero no en disco (o viceversa)
+    - delete:   en index pero borrado en disco y sin cambios staged
+    - modified: sha distinto entre disco y lo registrado
+    """
+    # sha del disco por archivo
+    disk = {}
+    for root, dirs, filenames in os.walk(repo):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        root_rel = os.path.relpath(root, repo).replace(os.sep, "/")
+        for fn in filenames:
+            path = fn if root_rel == "." else f"{root_rel}/{fn}"
+            with open(os.path.join(root, fn), "rb") as f:
+                disk[path] = write_object(repo, f.read(), OBJ_BLOB)
+    indexed = dict(index_read(repo))
+    head_tree = get_index_tree(repo)
+
+    add = [p for p in disk if p not in indexed and p not in head_tree]
+    delete = [p for p in indexed if p not in disk and indexed[p] == head_tree.get(p)]
+    modified = [p for p in disk if p in indexed and indexed[p] != disk[p]]
+    return add, delete, modified
+
+
+# --- Checkout (fase 3) ---
+
+def checkout(repo, target):
+    """Cambia de rama (creándola si no existe) y reconstruye el working tree."""
+    branch_path = repo_dir(repo, "refs", "heads", target)
+    if not os.path.exists(branch_path):
+        head = commit_head(repo)
+        if not head:
+            raise Exception("No hay commits a los que hacer checkout")
+        branch_write(repo, target, head)
+        print(f"Cambiado a nueva rama '{target}'")
+    else:
+        print(f"Cambiado a rama '{target}'")
+
+    set_head_branch(repo, target)
+    head = commit_head(repo)
+    assert head, "Rama sin commit"
+
+    # Recolecta y materializa los archivos de la rama destino
+    obj_type, data = read_object(repo, head)
+    tree_sha = data.split(b"\n")[0].split(b" ")[1].decode()
+    target_files = set()
+
+    def walk(sha, prefix, out):
+        for mode, obj_type, item_sha, name in tree_read(repo, sha):
+            path = f"{prefix}{name}"
+            if obj_type == OBJ_TREE:
+                os.makedirs(os.path.join(repo, prefix, name), exist_ok=True)
+                walk(item_sha, path + "/", out)
+            else:
+                out.add(path)
+                obj_type_b, blob = read_object(repo, item_sha)
+                with open(os.path.join(repo, prefix, name), "wb") as f:
+                    f.write(blob)
+
+    walk(tree_sha, "", target_files)
+
+    # Borra del working tree los archivos que no pertenecen a la rama destino
+    removed = []
+    for root, dirs, filenames in os.walk(repo):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        root_rel = os.path.relpath(root, repo).replace(os.sep, "/")
+        for fn in filenames:
+            path = fn if root_rel == "." else f"{root_rel}/{fn}"
+            if path not in target_files:
+                os.remove(os.path.join(root, fn))
+                removed.append(path)
+    for name in removed:
+        print(f"Borrado del working tree: {name}")
+
+
 
 
 # --- Log (fase 2) ---
@@ -259,6 +421,11 @@ def main(argv=sys.argv[1:]):
 
     sub.add_parser("log", help="Muestra el historial de commits")
 
+    sub.add_parser("status", help="Archivos añadidos, borrados y modificados")
+
+    p_checkout = sub.add_parser("checkout", help="Cambia de rama (la crea si no existe)")
+    p_checkout.add_argument("branch", help="Rama destino")
+
     args = parser.parse_args(argv)
 
     if args.command == "init":
@@ -267,6 +434,18 @@ def main(argv=sys.argv[1:]):
         commit(".", args.message)
     elif args.command == "log":
         log(".")
+    elif args.command == "status":
+        add, delete, modified = get_status(".")
+        for name in add:
+            print(f"added:   {name}")
+        for name in delete:
+            print(f"deleted: {name}")
+        for name in modified:
+            print(f"modified: {name}")
+        if not (add or delete or modified):
+            print("Sin cambios.")
+    elif args.command == "checkout":
+        checkout(".", args.branch)
     else:
         parser.error(f"Comando desconocido: {args.command}")
 
