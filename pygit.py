@@ -339,6 +339,149 @@ def checkout(repo, target):
 
 
 
+# --- Commit: helpers (fase 4) ---
+
+def commit_data_parse(repo, sha):
+    """Devuelve (tree_sha, [padres], mensaje) de un commit."""
+    obj_type, data = read_object(repo, sha)
+    text = data.decode(errors="replace")
+    lines = text.splitlines()
+    blank = lines.index("")
+    tree_sha = ""
+    parents = []
+    for line in lines[:blank]:
+        field, _, value = line.partition(" ")
+        if field == "tree":
+            tree_sha = value
+        elif field == "parent":
+            parents.append(value)
+    return tree_sha, parents, lines[blank + 1:]
+
+
+def commit_index(repo, head):
+    """Devuelve {path: sha} con todos los archivos del tree de un commit."""
+    index = {}
+    if not head:
+        return index
+    tree_sha = commit_data_parse(repo, head)[0]
+
+    def walk(sha, prefix):
+        for mode, obj_type, item_sha, name in tree_read(repo, sha):
+            path = f"{prefix}{name}"
+            if obj_type == OBJ_TREE:
+                walk(item_sha, path + "/")
+            else:
+                index[path] = item_sha
+
+    walk(tree_sha, "")
+    return index
+
+
+def merge_base(repo, a, b):
+    """Devuelve el ancestor común más reciente de dos commits (o None)."""
+    # Todos los ancestros de 'a'
+    ancestors_a = set()
+    stack = [a]
+    while stack:
+        sha = stack.pop()
+        if sha in ancestors_a:
+            continue
+        ancestors_a.add(sha)
+        stack.extend(commit_data_parse(repo, sha)[1])
+
+    # Recorre ancestros de 'b' hasta tocar el conjunto de 'a'
+    seen = set()
+    stack = [b]
+    while stack:
+        sha = stack.pop()
+        if sha in seen:
+            continue
+        seen.add(sha)
+        if sha in ancestors_a:
+            return sha
+        stack.extend(commit_data_parse(repo, sha)[1])
+    return None
+
+
+# --- Merge (fase 4) ---
+
+def merge(repo, branch):
+    """Merge <branch> en la rama actual (y commit si no hay conflictos)."""
+    our_branch = read_ref(repo)
+    head = commit_head(repo)
+    their_head = None
+    with open(repo_dir(repo, "refs", "heads", branch)) as f:
+        their_head = f.read().strip()
+    assert their_head, f"Rama '{branch}' sin commits"
+
+    # El ancestor común
+    ancestor = merge_base(repo, head, their_head)
+    ancestor = commit_index(repo, ancestor)
+    ours = commit_index(repo, head)
+    theirs = commit_index(repo, their_head)
+
+    changed = False
+    for path in set(ancestor) | set(ours) | set(theirs):
+        ash = ancestor.get(path)
+        bsh = ours.get(path)
+        csh = theirs.get(path)
+        # igual en ambas ramas: no hay nada que hacer
+        if bsh == csh:
+            continue
+        elif ash == bsh:               # solo cambia en la otra rama: coger c
+            changed = True
+            if csh is None:
+                del ours[path]
+            else:
+                ours[path] = csh
+        elif ash == csh:               # solo cambia en nuestra rama: vale b
+            continue
+        else:
+            our_data = read_object(repo, bsh)[1].decode(errors="replace")
+            their_data = read_object(repo, csh)[1].decode(errors="replace")
+            print(f"CONFLICT en {path}")
+            print(f"  nuestro:    {our_data}")
+            print(f"  suyo:       {their_data}")
+            print("  Falta 3-way merge real: aborta")
+            sys.exit(1)
+
+    # Actualiza el working tree con el resultado (archivos de 'ours')
+    for path, sha in ours.items():
+        dest = os.path.join(repo, path.replace("/", os.sep))
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "wb") as f:
+            f.write(read_object(repo, sha)[1])
+    # y borra del disco los archivos que el merge eliminó
+    on_disk = []
+    for root, dirs, filenames in os.walk(repo):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        root_rel = os.path.relpath(root, repo).replace(os.sep, "/")
+        on_disk += [fn if root_rel == "." else f"{root_rel}/{fn}" for fn in filenames]
+    for path in set(on_disk) - set(ours):
+        os.remove(os.path.join(repo, path.replace("/", os.sep)))
+
+    # index = files (staged), luego commit con 2 padres
+    index_write(repo, ours.items())
+
+    timestamp = int(time.time())
+    tz = time.strftime("%z")
+    author = "PyGit User <pygit@example.com>"
+    message = f"Merged branch '{branch}' into {our_branch}"
+    data = (
+        b"tree " + build_tree(repo, ours).encode() + b"\n"
+        + b"parent " + head.encode() + b"\n"
+        + b"parent " + their_head.encode() + b"\n"
+        + b"author " + author.encode() + b" " + str(timestamp).encode() + b" " + tz.encode() + b"\n"
+        + b"committer " + author.encode() + b" " + str(timestamp).encode() + b" " + tz.encode() + b"\n\n"
+        + message.encode() + b"\n"
+    )
+    sha = write_object(repo, data, OBJ_COMMIT)
+    branch_write(repo, our_branch, sha)
+    print(f"[{our_branch} {sha[:7]}] {message}")
+
+
+
+
 # --- Log (fase 2) ---
 
 def log(repo):
@@ -426,6 +569,9 @@ def main(argv=sys.argv[1:]):
     p_checkout = sub.add_parser("checkout", help="Cambia de rama (la crea si no existe)")
     p_checkout.add_argument("branch", help="Rama destino")
 
+    p_merge = sub.add_parser("merge", help="Fusiona <rama> en la rama actual")
+    p_merge.add_argument("branch", help="Rama a fusionar")
+
     args = parser.parse_args(argv)
 
     if args.command == "init":
@@ -446,6 +592,8 @@ def main(argv=sys.argv[1:]):
             print("Sin cambios.")
     elif args.command == "checkout":
         checkout(".", args.branch)
+    elif args.command == "merge":
+        merge(".", args.branch)
     else:
         parser.error(f"Comando desconocido: {args.command}")
 
