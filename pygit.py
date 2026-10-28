@@ -514,6 +514,84 @@ def merge(repo, branch):
 
 
 
+# --- Tags (fase 8) ---
+
+def tag_annotate(repo, name, message):
+    """Crea un tag anotado: objeto 'tag' real en .git/objects y en refs/tags."""
+    head = commit_head(repo)
+    if not head:
+        print("ERROR: no hay commits para etiquetar")
+        sys.exit(1)
+    tag_dir = repo_dir(repo, "refs", "tags")
+    os.makedirs(tag_dir, exist_ok=True)
+    path = os.path.join(tag_dir, name)
+    if os.path.exists(path):
+        print(f"ERROR: el tag '{name}' ya existe")
+        sys.exit(1)
+    timestamp = int(time.time())
+    tz = time.strftime("%z")
+    author = "PyGit User <pygit@example.com>"
+    data = (
+        b"object " + head.encode() + b"\n"
+        + b"type commit\n"
+        + b"tag " + name.encode() + b"\n"
+        + b"tagger " + author.encode() + b" " + str(timestamp).encode() + b" " + tz.encode() + b"\n\n"
+        + message.encode() + b"\n"
+    )
+    sha = write_object(repo, data, b"tag")
+    with open(path, "w", newline="\n") as f:
+        f.write(sha + "\n")
+    print(f"Tag anotado '{name}' -> {sha[:7]} (commit {head[:7]})")
+
+
+def tag_lightweight(repo, name, target=None):
+    """Crea un tag ligero: la ref apunta directamente al commit (o sha dado)."""
+    if target:
+        sha = None
+        # resuelve el argumento: rama o prefijo de sha
+        branch = repo_dir(repo, "refs", "heads", target)
+        if os.path.exists(branch):
+            with open(branch) as f:
+                sha = f.read().strip()
+        if not sha:
+            sha = find_object(repo, target)
+        if not sha:
+            print(f"ERROR: no encuentro '{target}' ni como rama ni como sha")
+            sys.exit(1)
+    else:
+        sha = commit_head(repo)
+        if not sha:
+            print("ERROR: no hay commits para etiquetar")
+            sys.exit(1)
+    tag_dir = repo_dir(repo, "refs", "tags")
+    os.makedirs(tag_dir, exist_ok=True)
+    with open(os.path.join(tag_dir, name), "w", newline="\n") as f:
+        f.write(sha + "\n")
+    print(f"Tag ligero '{name}' -> {sha[:7]}")
+
+
+def tag_list(repo):
+    """Lista los tags; los anotados muestran el commit etiquetado."""
+    tags_dir = repo_dir(repo, "refs", "tags")
+    if not os.path.isdir(tags_dir):
+        return
+    for name in sorted(os.listdir(tags_dir)):
+        with open(os.path.join(tags_dir, name)) as f:
+            sha = f.read().strip()
+        try:
+            obj_type, data = read_object(repo, sha)
+        except FileNotFoundError:
+            obj_type = "?"
+        if obj_type == b"tag":
+            commit_sha = next(
+                line.split(" ")[1] for line in data.decode().splitlines()
+                if line.startswith("object ")
+            )
+            print(f"{name} (anotado) <== commit {commit_sha[:7]}")
+        else:
+            print(f"{name} -> {sha[:7]}")
+
+
 # --- Merge de líneas, 3-way real (fase 5) ---
 
 def sync_regions(base, ours, theirs):
@@ -771,6 +849,13 @@ def main(argv=sys.argv[1:]):
     p_branch = sub.add_parser("branch", help="Lista las ramas")
     p_branch.add_argument("-d", "--delete", metavar="RAMA", help="Borra la rama")
 
+    p_tag = sub.add_parser("tag", help="Lista tags (o crea con -a/-l)")
+    p_tag.add_argument("name", nargs="?", help="Nombre del tag a crear")
+    p_tag.add_argument("-a", "--annotate", action="store_true", help="Tag anotado")
+    p_tag.add_argument("-m", "--message", help="Mensaje del tag anotado")
+    p_tag.add_argument("target", nargs="?", default=None,
+                       help="Commit/rama destino (tag ligero)")
+
     args = parser.parse_args(argv)
 
     if args.command == "init":
@@ -810,6 +895,14 @@ def main(argv=sys.argv[1:]):
             branch_delete(".", args.delete)
         else:
             branch_list(".")
+    elif args.command == "tag":
+        if args.name:
+            if args.annotate or args.message:
+                tag_annotate(".", args.name, args.message or f"Tag {args.name}")
+            else:
+                tag_lightweight(".", args.name, args.target)
+        else:
+            tag_list(".")
     else:
         parser.error(f"Comando desconocido: {args.command}")
 

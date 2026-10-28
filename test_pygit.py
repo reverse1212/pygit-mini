@@ -225,6 +225,45 @@ def test_merge_flujo_completo_resolucion_manual(repo):
     assert read(repo, "c.txt") == "v-resuelto\n"
 
 
+# --- tags ---
+
+def test_tag_ligero(repo):
+    write(repo, "a.txt", "1")
+    run(repo, "add", "a.txt")
+    run(repo, "commit", "-m", "base")
+    run(repo, "tag", "v1")
+    out = run(repo, "tag").stdout
+    assert "v1" in out
+    proc = subprocess.run(
+        ["git", "for-each-ref", "refs/tags", "--format=%(refname:short)"],
+        cwd=repo, capture_output=True, text=True,
+    )
+    assert "v1" in proc.stdout
+
+
+def test_tag_anotado_es_objeto_tag_real(repo):
+    write(repo, "a.txt", "1")
+    run(repo, "add", "a.txt")
+    run(repo, "commit", "-m", "base")
+    run(repo, "tag", "-a", "v1.0", "-m", "primera versión")
+    out = run(repo, "tag").stdout
+    assert "v1.0 (anotado)" in out
+    # git debe poder desreferenciarlo
+    proc = subprocess.run(
+        ["git", "tag", "-n1"], cwd=repo, capture_output=True, text=True,
+    )
+    assert "v1.0" in proc.stdout and "primera" in proc.stdout
+
+
+def test_tag_duplicado_falla(repo):
+    write(repo, "a.txt", "1")
+    run(repo, "add", "a.txt")
+    run(repo, "commit", "-m", "base")
+    run(repo, "tag", "v1")
+    proc = run(repo, "tag", "-a", "v1", "-m", "otro", ok=False)
+    assert proc.returncode != 0
+
+
 # --- rm / diff ---
 
 def test_rm_borra_del_index_y_disco(repo):
