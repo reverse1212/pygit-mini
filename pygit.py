@@ -626,6 +626,75 @@ def commit_parse_timestamp(data):
     return 0
 
 
+# --- Diff y branch (fase 6) ---
+
+def diff(repo):
+    """Diff unificado entre HEAD y el working tree (como git diff)."""
+    head_tree = commit_index(repo, commit_head(repo))
+    changed = False
+    # Archivos según el último commit
+    for path, sha in sorted(head_tree.items()):
+        _, old_blob = read_object(repo, sha)
+        disk_path = os.path.join(repo, path.replace("/", os.sep))
+        if os.path.exists(disk_path):
+            with open(disk_path, "rb") as f:
+                new_data = f.read()
+        else:
+            new_data = b""
+        if new_data != old_blob:
+            changed = True
+            _print_diff(path, old_blob, new_data)
+    # Archivos nuevos en disco que no están en HEAD
+    for root, dirs, filenames in os.walk(repo):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        root_rel = os.path.relpath(root, repo).replace(os.sep, "/")
+        for fn in filenames:
+            path = fn if root_rel == "." else f"{root_rel}/{fn}"
+            if path not in head_tree:
+                changed = True
+                with open(os.path.join(root, fn), "rb") as f:
+                    new_data = f.read()
+                _print_diff(path, b"", new_data)
+    if not changed:
+        print("Sin diferencias con respecto a HEAD.")
+
+
+def _print_diff(path, old_data, new_data):
+    print(f"diff --git a/{path} b/{path}")
+    # ignora diferencias de salto de línea final al comparar líneas
+    old_lines = old_data.decode(errors="replace").splitlines(keepends=True)
+    new_lines = new_data.decode(errors="replace").splitlines(keepends=True)
+    diff_lines = difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile=f"a/{path}", tofile=f"b/{path}",
+    )
+    for line in diff_lines:
+        sys.stdout.write(line if line.endswith("\n") else line + "\n")
+
+
+def branch_list(repo):
+    """Lista las ramas; marca la actual con '* '."""
+    current = read_ref(repo)
+    heads = repo_dir(repo, "refs", "heads")
+    if os.path.isdir(heads):
+        for name in sorted(os.listdir(heads)):
+            marker = "*" if name == current else " "
+            print(f"{marker} {name}")
+
+
+def branch_delete(repo, name):
+    """Borra la rama <name> (no la actual; sin commit propio = no existente)."""
+    if name == read_ref(repo):
+        print(f"ERROR: no se puede borrar la rama actual '{name}'")
+        sys.exit(1)
+    path = repo_dir(repo, "refs", "heads", name)
+    if not os.path.exists(path):
+        print(f"ERROR: la rama '{name}' no existe")
+        sys.exit(1)
+    os.remove(path)
+    print(f"Rama '{name}' borrada")
+
+
 # --- Comandos ---
 
 
@@ -677,6 +746,11 @@ def main(argv=sys.argv[1:]):
     p_merge = sub.add_parser("merge", help="Fusiona <rama> en la rama actual")
     p_merge.add_argument("branch", help="Rama a fusionar")
 
+    sub.add_parser("diff", help="Diff unificado entre HEAD y el working tree")
+
+    p_branch = sub.add_parser("branch", help="Lista las ramas")
+    p_branch.add_argument("-d", "--delete", metavar="RAMA", help="Borra la rama")
+
     args = parser.parse_args(argv)
 
     if args.command == "init":
@@ -699,6 +773,13 @@ def main(argv=sys.argv[1:]):
         checkout(".", args.branch)
     elif args.command == "merge":
         merge(".", args.branch)
+    elif args.command == "diff":
+        diff(".")
+    elif args.command == "branch":
+        if args.delete:
+            branch_delete(".", args.delete)
+        else:
+            branch_list(".")
     else:
         parser.error(f"Comando desconocido: {args.command}")
 
