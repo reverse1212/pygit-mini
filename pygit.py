@@ -11,6 +11,7 @@ import argparse
 import difflib
 import hashlib
 import heapq
+import json
 import os
 import shutil
 import sys
@@ -889,6 +890,104 @@ def pull(repo, remote, branch=None):
     print(f"pull: '{name}/{branch}' integrado en '{branch}'")
 
 
+# --- Stash y revert (fase 12, pulido final) ---
+
+STASH_FILE = "pygit-stash"
+
+
+def stash(repo, message=None):
+    """Guarda el estado actual (index+worktree) y lo restaura desde HEAD.
+
+    Equivale a `git stash`: limpiar los cambios sin perderlos.
+    """
+    staged, unstaged = get_status(repo)
+    if not (any(staged) or any(unstaged)):
+        print("No hay cambios locales para guardar.")
+        return
+
+    # snapshot: {path: sha} del estado mezclado index/disco (disco manda si toca)
+    disk = {}
+    for root, dirs, filenames in os.walk(repo):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        root_rel = os.path.relpath(root, repo).replace(os.sep, "/")
+        for fn in filenames:
+            path = fn if root_rel == "." else f"{root_rel}/{fn}"
+            with open(os.path.join(root, fn), "rb") as f:
+                data = f.read()
+            disk[path] = write_object(repo, data, OBJ_BLOB)
+    index = dict(index_read(repo))
+    # snapshot = archivos del disco con su sha actual
+    snapshot = dict(disk)
+    # y la lista de lo borrado (estaba en el index, ya no en el disco)
+    deleted = [p for p in index if p not in disk]
+
+    base = commit_head(repo)
+    if not base:
+        print("ERROR: stash sin commits previos")
+        sys.exit(1)
+    entry = {
+        "message": message or f"WIP en {read_ref(repo)}",
+        "base": base,
+        "snapshot": snapshot,
+        "deleted": deleted,
+    }
+    # apila el entry en el archivo de stash (JSON por línea)
+    with open(repo_dir(repo, STASH_FILE), "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+    # restaura el working tree + index desde HEAD
+    materialize(repo, base)
+    print(f"Guardado stash: {entry['message']}")
+
+
+def stash_pop(repo):
+    """Aplica el último stash y lo saca de la pila."""
+    path = repo_dir(repo, STASH_FILE)
+    if not os.path.exists(path):
+        print("No hay stash que aplicar.")
+        sys.exit(1)
+    with open(path) as f:
+        lines = [l for l in f.read().splitlines() if l.strip()]
+    if not lines:
+        print("No hay stash que aplicar.")
+        sys.exit(1)
+    entry = json.loads(lines[-1])
+    del lines[-1]
+
+    # escribe el snapshot sobre el working tree y el index
+    for rel_path, sha in entry["snapshot"].items():
+        data = read_object(repo, sha)[1]
+        dest = os.path.join(repo, rel_path.replace("/", os.sep))
+        os.makedirs(os.path.dirname(dest) or repo, exist_ok=True)
+        with open(dest, "wb") as f:
+            f.write(data)
+        print(f"Restaurado: {rel_path}")
+    for rel_path in entry["deleted"]:
+        disk_path = os.path.join(repo, rel_path.replace("/", os.sep))
+        if os.path.exists(disk_path):
+            os.remove(disk_path)
+        print(f"Restaurado borrado: {rel_path}")
+    index_write(repo, list(entry["snapshot"].items()))
+
+    with open(path, "w", newline="\n") as f:
+        f.write("\n".join(lines) + ("\n" if lines else ""))
+    remaining = len(lines)
+    print(f"Stash '{entry['message']}' aplicado ({remaining} en la pila)")
+
+
+def revert(repo):
+    """Restaura los cambios NO committeados desde HEAD (git checkout -- .).
+
+    ¡Destructivo! El working tree y el index vuelven al último commit.
+    """
+    head = commit_head(repo)
+    if not head:
+        print("ERROR: no hay commits a los que volver")
+        sys.exit(1)
+    materialize(repo, head)
+    print(f"Changes revertidos a {head[:7]}")
+
+
 # --- Log (fase 2) ---
 
 def log(repo):
@@ -1090,6 +1189,11 @@ def main(argv=sys.argv[1:]):
     p_pull.add_argument("remote")
     p_pull.add_argument("branch", nargs="?", default=None)
 
+    p_stash = sub.add_parser("stash", help="Guarda los cambios y limpia el worktree")
+    p_stash.add_argument("message", nargs="?", default=None)
+    sub.add_parser("stash-pop", help="Aplica y quita el último stash")
+    sub.add_parser("revert", help="Revierte worktree+index al último commit")
+
     args = parser.parse_args(argv)
 
     if args.command == "init":
@@ -1147,6 +1251,12 @@ def main(argv=sys.argv[1:]):
         push(".", args.remote, args.branch)
     elif args.command == "pull":
         pull(".", args.remote, args.branch)
+    elif args.command == "stash":
+        stash(".", args.message)
+    elif args.command == "stash-pop":
+        stash_pop(".")
+    elif args.command == "revert":
+        revert(".")
     else:
         parser.error(f"Comando desconocido: {args.command}")
 

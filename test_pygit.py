@@ -313,6 +313,43 @@ def test_clone_local(repo, tmp_path):
     assert "base en t8" in proc.stdout
 
 
+# --- stash / revert ---
+
+def test_stash_guarda_y_limpia(repo):
+    _commit(repo, "f.txt", "version commit", "base")
+    write(repo, "f.txt", "cambio no commiteado")
+    write(repo, "nuevo.txt", "archivo nuevo")
+    out = run(repo, "stash", "mi trabajo").stdout
+    assert "Guardado stash" in out
+    # el working tree vuelve al último commit
+    assert read(repo, "f.txt") == "version commit"
+    assert not os.path.exists(os.path.join(repo, "nuevo.txt"))
+    out = run(repo, "status").stdout
+    assert "Sin cambios" in out
+
+
+def test_stash_pop_restaura_todo(repo):
+    _commit(repo, "f.txt", "version commit", "base")
+    write(repo, "f.txt", "cambio no commiteado")
+    write(repo, "nuevo.txt", "archivo nuevo")
+    run(repo, "stash", " trabajo")
+    run(repo, "stash-pop")
+    assert read(repo, "f.txt") == "cambio no commiteado"
+    assert read(repo, "nuevo.txt") == "archivo nuevo"
+    # la pila queda vacía
+    proc = run(repo, "stash-pop", ok=False)
+    assert proc.returncode != 0
+
+
+def test_revert_ultima_modificacion(repo):
+    _commit(repo, "a.txt", "committed", "base")
+    write(repo, "a.txt", "convulsión local")
+    write(repo, "b.txt", "nuevo")
+    out = run(repo, "revert").stdout
+    assert read(repo, "a.txt") == "committed"
+    assert not os.path.exists(os.path.join(repo, "b.txt"))
+
+
 # --- push / fetch ---
 
 def _commit(repo, name, content, msg):
