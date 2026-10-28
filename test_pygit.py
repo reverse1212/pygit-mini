@@ -392,6 +392,53 @@ def test_clone_y_push_son_simetricos(repo, tmp_path):
     assert proc.stdout.strip() == "v1"
 
 
+# --- pull ---
+
+def test_pull_fast_forward(repo, tmp_path):
+    import os as _os
+    _commit(repo, "a.txt", "v0", "v0")
+    clon = _os.path.join(str(tmp_path), "clon")
+    run(repo, "clone", repo, clon)
+    _commit(repo, "nuevo.txt", "novedad", "v1-en-origen")
+    out = run(clon, "pull", repo).stdout
+    assert "fast-forward" in out
+    assert open(_os.path.join(clon, "nuevo.txt"), encoding="utf-8").read() == "novedad"
+    # la rama local del clon avanza al commit del origen
+    proc = subprocess.run(
+        ["git", "log", "--oneline"], cwd=clon, capture_output=True, text=True
+    )
+    assert "v1-en-origen" in proc.stdout.splitlines()[0]
+
+
+def test_pull_divergente_crea_commit_de_merge(repo, tmp_path):
+    import os as _os
+    _commit(repo, "local.txt", "en origen", "v1")
+    clon = _os.path.join(str(tmp_path), "clon")
+    run(repo, "clone", repo, clon)
+    _commit(repo, "solo-origen.txt", "x", "v2-en-origen")
+    _commit(clon, "solo-clon.txt", "y", "v2-en-clon")
+    out = run(clon, "pull", repo).stdout
+    proc = subprocess.run(
+        ["git", "log", "--oneline"], cwd=clon, capture_output=True, text=True
+    )
+    lines = proc.stdout.splitlines()
+    assert "v2-en-origen" in "\n".join(lines)
+    assert "v2-en-clon" in "\n".join(lines)
+    # el último commit debe ser un merge (dos padres)
+    proc2 = subprocess.run(
+        ["git", "log", "-1", "--format=%p"], cwd=clon, capture_output=True, text=True
+    )
+    assert len(proc2.stdout.split()) == 2
+
+
+def test_pull_cuando_ya_estas_al_dia(repo, tmp_path):
+    import os as _os
+    _commit(repo, "a.txt", "v0", "v0")
+    clon = _os.path.join(str(tmp_path), "clon")
+    run(repo, "clone", repo, clon)
+    out = run(clon, "pull", repo).stdout
+    assert "al día" in out or "al d" in out
+
 # --- rm / diff ---
 
 def test_rm_borra_del_index_y_disco(repo):

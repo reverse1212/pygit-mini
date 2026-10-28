@@ -298,26 +298,12 @@ def remove(repo, paths):
     index_write(repo, entries.items())
 
 
-# --- Checkout (fase 3) ---
+# --- Checkout (fase 3; materialize extraída en fase 11) ---
 
-def checkout(repo, target):
-    """Cambia de rama (creándola si no existe) y reconstruye el working tree."""
-    branch_path = repo_dir(repo, "refs", "heads", target)
-    if not os.path.exists(branch_path):
-        head = commit_head(repo)
-        if not head:
-            raise Exception("No hay commits a los que hacer checkout")
-        branch_write(repo, target, head)
-        print(f"Cambiado a nueva rama '{target}'")
-    else:
-        print(f"Cambiado a rama '{target}'")
-
-    set_head_branch(repo, target)
-    head = commit_head(repo)
-    assert head, "Rama sin commit"
-
-    # Recolecta y materializa los archivos de la rama destino
-    obj_type, data = read_object(repo, head)
+def materialize(repo, commit_sha):
+    """Escribe el tree de un commit en el working tree, borra lo sobrante
+    y reinicia el index (usado por checkout y pull)."""
+    obj_type, data = read_object(repo, commit_sha)
     tree_sha = data.split(b"\n")[0].split(b" ")[1].decode()
     target_files = set()
 
@@ -335,11 +321,7 @@ def checkout(repo, target):
 
     walk(tree_sha, "", target_files)
 
-    # El index se reinicia al contenido exacto de la rama destino
-    index_write(repo, commit_index(repo, head).items())
-
-    # Borra del working tree los archivos que no pertenecen a la rama destino
-    removed = []
+    # borra del working tree los archivos que no pertenecen al target
     for root, dirs, filenames in os.walk(repo):
         dirs[:] = [d for d in dirs if d != ".git"]
         root_rel = os.path.relpath(root, repo).replace(os.sep, "/")
@@ -347,9 +329,27 @@ def checkout(repo, target):
             path = fn if root_rel == "." else f"{root_rel}/{fn}"
             if path not in target_files:
                 os.remove(os.path.join(root, fn))
-                removed.append(path)
-    for name in removed:
-        print(f"Borrado del working tree: {name}")
+
+    # el index se reinicia al contenido exacto del commit
+    index_write(repo, commit_index(repo, commit_sha).items())
+
+
+def checkout(repo, target):
+    """Cambia de rama (creándola si no existe) y reconstruye el working tree."""
+    branch_path = repo_dir(repo, "refs", "heads", target)
+    if not os.path.exists(branch_path):
+        head = commit_head(repo)
+        if not head:
+            raise Exception("No hay commits a los que hacer checkout")
+        branch_write(repo, target, head)
+        print(f"Cambiado a nueva rama '{target}'")
+    else:
+        print(f"Cambiado a rama '{target}'")
+
+    set_head_branch(repo, target)
+    head = commit_head(repo)
+    assert head, "Rama sin commit"
+    materialize(repo, head)
 
 
 
@@ -418,16 +418,20 @@ def merge_base(repo, a, b):
     return None
 
 
-# --- Merge (fase 4) ---
+# --- Merge (fase 4; acepta sha/remoto desde fase 11) ---
 
-def merge(repo, branch):
-    """Merge <branch> en la rama actual (y commit si no hay conflictos)."""
+def merge(repo, branch, name=None):
+    """Merge de <branch> (rama, refs/remotes/x/y o sha) en la rama actual."""
     our_branch = read_ref(repo)
     head = commit_head(repo)
-    their_head = None
-    with open(repo_dir(repo, "refs", "heads", branch)) as f:
-        their_head = f.read().strip()
-    assert their_head, f"Rama '{branch}' sin commits"
+    branch_ref = repo_dir(repo, "refs", "heads", branch)
+    if os.path.exists(branch_ref):
+        with open(branch_ref) as f:
+            their_head = f.read().strip()
+    else:
+        # puede ser un sha (pull desde refs/remotes) — el objeto ya lo tenemos
+        their_head = find_object(repo, branch)
+    assert their_head, f"Rama o sha '{branch}' sin commits"
 
     # El ancestor común
     ancestor = merge_base(repo, head, their_head)
@@ -461,7 +465,8 @@ def merge(repo, branch):
             if csh is not None:
                 their_data = read_object(repo, csh)[1]
             merged, conflicted = merge_content(
-                base_data or b"", ours_data or b"", their_data or b"", branch
+                base_data or b"", ours_data or b"", their_data or b"",
+                label=(name or (branch[:7] if len(branch) == 40 else branch)),
             )
             # sustituye la entrada por el texto fusionado (con marcadores si hay)
             ours[path] = write_object(repo, merged, OBJ_BLOB)
@@ -499,7 +504,8 @@ def merge(repo, branch):
     timestamp = int(time.time())
     tz = time.strftime("%z")
     author = "PyGit User <pygit@example.com>"
-    message = f"Merged branch '{branch}' into {our_branch}"
+    label_branch = branch if len(branch) != 40 else branch[:7]
+    message = f"Merged branch '{label_branch}' into {our_branch}"
     data = (
         b"tree " + build_tree(repo, ours).encode() + b"\n"
         + b"parent " + head.encode() + b"\n"
@@ -693,7 +699,7 @@ def sync_regions(base, ours, theirs):
     return regions
 
 
-def merge_content(base_data, ours_data, theirs_data, branch):
+def merge_content(base_data, ours_data, theirs_data, label):
     """Merge de líneas con marcadores de conflicto.
 
     Devuelve (bytes_resultado, conflicted: bool).
@@ -709,7 +715,7 @@ def merge_content(base_data, ours_data, theirs_data, branch):
     theirs = theirs_data.splitlines(keepends=True)
     marker_our = b"<<<<<<< HEAD\n"
     marker_sep = b"=======\n"
-    marker_their = f">>>>>>> {branch}\n".encode()
+    marker_their = f">>>>>>> {label}\n".encode()
 
     regions = sync_regions(base, ours, theirs)
     result = []
@@ -840,6 +846,47 @@ def push(repo, remote, branch=None):
     with open(remote_ref, "w", newline="\n") as f:
         f.write(head + "\n")
     print(f"push {branch} -> {remote} ({head[:7]}), {copied} objetos nuevos")
+
+
+def pull(repo, remote, branch=None):
+    """fetch + merge: trae <branch> del remoto y la fusiona en la actual."""
+    fetch(repo, remote)
+    name = _remote_name(repo, remote)
+    branch = branch or read_ref(repo)
+    remote_sha_path = repo_dir(repo, "refs", "remotes", name, branch)
+    if not os.path.exists(remote_sha_path):
+        print(f"ERROR: el remoto '{name}' no tiene la rama '{branch}'")
+        sys.exit(1)
+    with open(remote_sha_path) as f:
+        remote_sha = f.read().strip()
+    head = commit_head(repo)
+    if head == remote_sha:
+        print(f"Ya estás al día con '{name}/{branch}'.")
+        return
+
+    # Gcaso1: el commit del remoto desciende de HEAD → fast-forward local
+    stack, seen = [remote_sha], set()
+    ffable = False
+    while stack:
+        sha = stack.pop()
+        if sha in seen or not sha:
+            continue
+        seen.add(sha)
+        if sha == head:
+            ffable = True
+            break
+        stack.extend(commit_data_parse(repo, sha)[1])
+
+    if ffable:
+        # avanza la ref local de la rama y materializa el working tree
+        branch_write(repo, branch, remote_sha)
+        materialize(repo, remote_sha)
+        print(f"pull: fast-forward a {remote_sha[:7]} ({name}/{branch})")
+    else:
+        # caso divergente: merge del commit traído, reutilizando merge()
+        print("pull: historias divergentes; merge del commit del remoto...")
+        merge(repo, remote_sha, name=name)
+    print(f"pull: '{name}/{branch}' integrado en '{branch}'")
 
 
 # --- Log (fase 2) ---
@@ -1039,6 +1086,10 @@ def main(argv=sys.argv[1:]):
     p_push.add_argument("remote")
     p_push.add_argument("branch", nargs="?", default=None)
 
+    p_pull = sub.add_parser("pull", help="fetch + merge de otro repo local")
+    p_pull.add_argument("remote")
+    p_pull.add_argument("branch", nargs="?", default=None)
+
     args = parser.parse_args(argv)
 
     if args.command == "init":
@@ -1094,6 +1145,8 @@ def main(argv=sys.argv[1:]):
         fetch(".", args.remote)
     elif args.command == "push":
         push(".", args.remote, args.branch)
+    elif args.command == "pull":
+        pull(".", args.remote, args.branch)
     else:
         parser.error(f"Comando desconocido: {args.command}")
 
