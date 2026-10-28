@@ -29,6 +29,10 @@ pygit init
 | `pygit checkout <rama>` | Cambia/crea rama y materializa el working tree |
 | `pygit merge <rama>` | 3-way merge con resolución de conflictos |
 | `pygit tag [-a -m "msg"] <nombre>` | Tags ligeros y anotados (objetos tag reales) |
+| `pygit tag -d <nombre>` | Borra un tag |
+| `pygit clone <origen> <destino>` | Clona un repositorio local (objetos+refs+worktree) |
+| `pygit fetch <remoto>` | Copia objetos y refs de otro repo local a `refs/remotes/<nombre>` |
+| `pygit push <remoto> [rama]` | Empuja commits a otro repo local (fast-forward) |
 | `pygit rm` | Borra del disco y del index |
 
 ## Interoperabilidad con git

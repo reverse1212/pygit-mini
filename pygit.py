@@ -747,6 +747,101 @@ def merge_content(base_data, ours_data, theirs_data, branch):
     return b"".join(result), conflicted
 
 
+# --- Push / fetch (fase 10) ---
+
+def _copy_objects(src_git, dst_objects):
+    """Copia a dst_objects los objetos de src_git que aún no existen all."""
+    src_objects = os.path.join(src_git, "objects")
+    copied = 0
+    if not os.path.isdir(src_objects):
+        return copied
+    for prefix in os.listdir(src_objects):
+        prefix_dir = os.path.join(src_objects, prefix)
+        if len(prefix) != 2 or not os.path.isdir(prefix_dir):
+            continue
+        for leftover in os.listdir(prefix_dir):
+            src_path = os.path.join(prefix_dir, leftover)
+            dst_dir = os.path.join(dst_objects, prefix)
+            dst_path = os.path.join(dst_dir, leftover)
+            if not os.path.exists(dst_path):
+                os.makedirs(dst_dir, exist_ok=True)
+                shutil.copy2(src_path, dst_path)
+                copied += 1
+    return copied
+
+
+def _remote_name(repo, remote):
+    """Resuelve el nombre corto del remoto para refs/remotes (basename)."""
+    return os.path.basename(os.path.abspath(remote.rstrip("\\/")))
+
+
+def fetch(repo, remote):
+    """Copia objetos y ramas de <remote> a refs/remotes/<nombre>."""
+    src_git = os.path.join(remote, ".git")
+    if not os.path.isdir(src_git):
+        print(f"ERROR: '{remote}' no es un repositorio pygit/git")
+        sys.exit(1)
+    name = _remote_name(repo, remote)
+
+    copied = _copy_objects(src_git, repo_dir(repo, "objects"))
+
+    heads = os.path.join(src_git, "refs", "heads")
+    if os.path.isdir(heads):
+        for root, dirs, files in os.walk(heads):
+            rel = os.path.relpath(root, heads)
+            for fn in files:
+                name_rel = fn if rel == "." else os.path.join(rel, fn)
+                dst = repo_dir(repo, "refs", "remotes", name, name_rel.replace(os.sep, "/"))
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(os.path.join(root, fn), dst)
+                with open(os.path.join(root, fn)) as f:
+                    sha = f.read().strip()
+                print(f"{name}/{name_rel} -> {sha[:7]}")
+    print(f"fetch: {copied} objetos nuevos de '{name}'")
+
+
+def push(repo, remote, branch=None):
+    """Empuja <branch> (o la actual) a <remote>, solo fast-forward."""
+    src_git = os.path.join(remote, ".git")
+    if not os.path.isdir(src_git):
+        print(f"ERROR: '{remote}' no es un repositorio pygit/git")
+        sys.exit(1)
+    branch = branch or read_ref(repo)
+    head = commit_head(repo)
+    if not head:
+        print("ERROR: no hay commits para empujar")
+        sys.exit(1)
+    remote_ref = os.path.join(src_git, "refs", "heads", branch.replace("/", os.sep))
+
+    # Copia solo los objetos que el remoto no tiene
+    copied = _copy_objects(repo_dir(repo), os.path.join(src_git, "objects"))
+    their_ref = None
+    if os.path.exists(remote_ref):
+        with open(remote_ref) as f:
+            their_ref = f.read().strip()
+    if their_ref and their_ref != head:
+        # ¿their_ref es ancestro de head? (buskando hacia atrás desde head)
+        stack, seen = [head], set()
+        ok = False
+        while stack:
+            sha = stack.pop()
+            if sha in seen or not sha:
+                continue
+            seen.add(sha)
+            if sha == their_ref:
+                ok = True
+                break
+            stack.extend(commit_data_parse(repo, sha)[1])
+        if not ok:
+            print("ERROR: non-fast-forward en "
+                  f"'{branch}' (el remoto tiene commits que no tienes; haz merge primero)")
+            sys.exit(1)
+    os.makedirs(os.path.dirname(remote_ref), exist_ok=True)
+    with open(remote_ref, "w", newline="\n") as f:
+        f.write(head + "\n")
+    print(f"push {branch} -> {remote} ({head[:7]}), {copied} objetos nuevos")
+
+
 # --- Log (fase 2) ---
 
 def log(repo):
@@ -937,6 +1032,13 @@ def main(argv=sys.argv[1:]):
     p_clone.add_argument("source")
     p_clone.add_argument("target")
 
+    p_fetch = sub.add_parser("fetch", help="Copia objetos y refs de otro repo local")
+    p_fetch.add_argument("remote")
+
+    p_push = sub.add_parser("push", help="Empuja a otro repo local (fast-forward)")
+    p_push.add_argument("remote")
+    p_push.add_argument("branch", nargs="?", default=None)
+
     args = parser.parse_args(argv)
 
     if args.command == "init":
@@ -988,6 +1090,10 @@ def main(argv=sys.argv[1:]):
             tag_list(".")
     elif args.command == "clone":
         clone(args.source, args.target)
+    elif args.command == "fetch":
+        fetch(".", args.remote)
+    elif args.command == "push":
+        push(".", args.remote, args.branch)
     else:
         parser.error(f"Comando desconocido: {args.command}")
 

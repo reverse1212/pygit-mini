@@ -313,6 +313,85 @@ def test_clone_local(repo, tmp_path):
     assert "base en t8" in proc.stdout
 
 
+# --- push / fetch ---
+
+def _commit(repo, name, content, msg):
+    write(repo, name, content)
+    run(repo, "add", name)
+    run(repo, "commit", "-m", msg)
+
+
+def _init_repo(path):
+    import os as _os
+    run(_os.path.dirname(path) or ".", "init", path)
+    return path
+
+
+def test_push_y_fetch_entre_repos(repo, tmp_path):
+    import os as _os
+    _commit(repo, "f.txt", "v0", "v0")
+    remoto = _os.path.join(str(tmp_path), "remoto")
+    _init_repo(remoto)
+    # push v0... no, push exige commits en el local: ya v0
+    run(repo, "push", remoto)
+    proc = subprocess.run(
+        ["git", "log", "--oneline"], cwd=remoto, capture_output=True, text=True
+    )
+    assert "v0" in proc.stdout
+    # nuevo commit y push fast-forward
+    _commit(repo, "f.txt", "v1", "v1")
+    run(repo, "push", remoto)
+    proc = subprocess.run(
+        ["git", "log", "--oneline"], cwd=remoto, capture_output=True, text=True
+    )
+    assert "v1" in proc.stdout and "v0" in proc.stdout
+
+
+def test_push_rechaza_non_fast_forward(repo, tmp_path):
+    import os as _os
+    _commit(repo, "f.txt", "base", "base")
+    remoto = _os.path.join(str(tmp_path), "remoto")
+    _init_repo(remoto)
+    run(repo, "push", remoto)
+    # el otro lado avanza con commit propio
+    _commit(remoto, "g.txt", "remoto", "commit-del-remoto")
+    # y localmente creamos un commit divergente
+    _commit(repo, "h.txt", "local", "commit-local-divergente")
+    proc = run(repo, "push", remoto, ok=False)
+    assert proc.returncode != 0
+    assert "non-fast-forward" in proc.stdout
+
+
+def test_fetch_importa_refs_y_objetos(repo, tmp_path):
+    import os as _os
+    _commit(repo, "f.txt", "origen", "en-origen")
+    remoto = _os.path.join(str(tmp_path), "remoto")
+    _init_repo(remoto)
+    _commit(remoto, "g.txt", "remoto", "en-remoto")
+    out = run(repo, "fetch", remoto).stdout
+    assert "remoto" in out
+    proc = subprocess.run(
+        ["git", "for-each-ref", "refs/remotes", "--format=%(refname:short)"],
+        cwd=repo, capture_output=True, text=True,
+    )
+    assert "remoto/master" in proc.stdout.replace("\\", "/")
+
+
+def test_clone_y_push_son_simetricos(repo, tmp_path):
+    """commit en origen -> clone -> commit en clon -> push -> origen lo ve."""
+    import os as _os
+    _commit(repo, "f.txt", "v0", "v0")
+    clon = _os.path.join(str(tmp_path), "clon")
+    run(repo, "clone", repo, clon)
+    _commit(clon, "f.txt", "v1", "v1-en-clon")
+    run(clon, "push", repo)
+    proc = subprocess.run(
+        ["git", "cat-file", "-p", "HEAD:f.txt"],
+        cwd=repo, capture_output=True, text=True,
+    )
+    assert proc.stdout.strip() == "v1"
+
+
 # --- rm / diff ---
 
 def test_rm_borra_del_index_y_disco(repo):
