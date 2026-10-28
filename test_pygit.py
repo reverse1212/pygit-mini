@@ -15,9 +15,10 @@ PYGIT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pygit.py")
 
 def run(repo, *args, ok=True):
     """Ejecuta el CLI de pygit en repo/ y devuelve stdout; falla si exit != 0."""
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     proc = subprocess.run(
         [sys.executable, PYGIT, *args],
-        cwd=repo, capture_output=True, text=True,
+        cwd=repo, capture_output=True, text=True, encoding="utf-8", env=env,
     )
     if ok and proc.returncode != 0:
         raise AssertionError(
@@ -502,3 +503,60 @@ def test_diff_muestra_cambios(repo):
     write(repo, "d.txt", "uno\nDOS CAMBIADO\n")
     out = run(repo, "diff").stdout
     assert "-dos" in out and "+DOS CAMBIADO" in out
+
+
+# --- log --graph / status --branch / clone tracking (fase 13) ---
+
+def test_log_graph_rombo_de_merge(repo):
+    _commit(repo, "a.txt", "v0", "base")
+    run(repo, "checkout", "feature")
+    _commit(repo, "f.txt", "feat", "commit feature")
+    run(repo, "checkout", "master")
+    _commit(repo, "m.txt", "master", "commit master")
+    run(repo, "merge", "feature")
+    out = run(repo, "log", "--graph").stdout
+    lines = out.splitlines()
+    assert lines[0].startswith("| *") or lines[0].startswith("* ")
+    assert "|\\\\" in out or "|\\" in out          # fork del merge
+    assert "|/" in out                            # union del rombo
+    # lo dibuja con la misma forma que git real
+    shape = [l.lstrip(" ") for l in lines]
+    assert "* " in out and ("| * " in out or any(l.startswith("| *") for l in lines))
+
+
+def test_status_branch_adelante_y_atras(repo, tmp_path):
+    import os as _os
+    _commit(repo, "a.txt", "v0", "base")
+    remoto = _os.path.join(str(tmp_path), "rem")
+    _init_repo(remoto)
+    run(repo, "push", remoto)
+    run(repo, "fetch", remoto)
+    # sin diferencia: al dia
+    out = run(repo, "status", "--branch").stdout
+    assert "al día" in out
+    # 1 adelante (ensuciamos en local)
+    _commit(repo, "a.txt", "v1", "adelante")
+    out = run(repo, "status", "--branch").stdout
+    assert "1 adelante" in out
+    # para medir el "atras", movemos el remoto en su propio repo y fetch
+    _commit(remoto, "b.txt", "rem", "trabajo remoto")
+    run(repo, "fetch", remoto)
+    out = run(repo, "status", "--branch").stdout
+    assert "1 adelante" in out and "1 atrás" in out
+
+
+def test_clone_crea_refs_remotes(tmp_path):
+    import os as _os
+    origen = _os.path.join(str(tmp_path), "origen")
+    _init_repo(origen)
+    _commit(origen, "f.txt", "v0", "base")
+    destino = _os.path.join(str(tmp_path), "copia")
+    run(str(tmp_path), "clone", origen, destino)
+    ref = _os.path.join(destino, ".git", "refs", "remotes")
+    nombres = _os.listdir(ref)
+    assert nombres, "clone no creo refs/remotes"
+    rem = nombres[0]
+    assert _os.path.exists(_os.path.join(ref, rem, "master"))
+    # y el status del clon fresco esta al dia
+    out = run(destino, "status", "--branch").stdout
+    assert "al día" in out

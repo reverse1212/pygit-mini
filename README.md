@@ -22,8 +22,8 @@ pygit init
 | `pygit init` | Crea `.git` (objects, refs/heads, HEAD) |
 | `pygit add <archivos\|.>` | Staging selectivo: crea blobs del index |
 | `pygit commit -m "msg"` | Tree (anidado, formato binario de git) + commit |
-| `pygit log` | Historial con orden topológico por tiempo |
-| `pygit status` | Staged / unstaged / untracked |
+| `pygit log [--graph]` | Historial ordenado por tiempo; con `--graph`, grafo ASCII de merges |
+| `pygit status [--branch]` | Staged / unstaged / untracked; con `--branch`, adelante/atrás frente al remoto |
 | `pygit diff` | Diff unificado entre HEAD y el working tree |
 | `pygit branch [-d <rama>]` | Lista o borra ramas |
 | `pygit checkout <rama>` | Cambia/crea rama y materializa el working tree |

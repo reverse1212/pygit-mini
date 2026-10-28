@@ -638,6 +638,7 @@ def clone(source, target):
 
     # Ramas y tags desde las refs de origen
     imported = 0
+    remote_name = _remote_name(target, source)
     for kind in ("heads", "tags"):
         src_refs = os.path.join(src_git, "refs", kind)
         if os.path.isdir(src_refs):
@@ -646,12 +647,22 @@ def clone(source, target):
             for root, dirs, files in os.walk(src_refs):
                 rel = os.path.relpath(root, src_refs)
                 for fn in files:
-                    name = fn if rel == "." else f"{rel}\\{fn}".replace("\\x00", "/")
-                    name = (fn if rel == "." else os.path.join(rel, fn))
+                    name = fn if rel == "." else os.path.join(rel, fn)
                     dst = os.path.join(dst_refs, name)
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
                     shutil.copy2(os.path.join(root, fn), dst)
                     imported += 1
+            # y el tracking correspondiente en refs/remotes/<origen>/...
+            if kind == "heads":
+                rem_dst = repo_dir(target, "refs", "remotes", remote_name)
+                os.makedirs(rem_dst, exist_ok=True)
+                for root, dirs, files in os.walk(src_refs):
+                    rel = os.path.relpath(root, src_refs)
+                    for fn in files:
+                        name = fn if rel == "." else os.path.join(rel, fn)
+                        dst = os.path.join(rem_dst, name)
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        shutil.copy2(os.path.join(root, fn), dst)
 
     # HEAD: usa la rama por defecto del origen
     with open(os.path.join(src_git, "HEAD")) as f:
@@ -988,34 +999,71 @@ def revert(repo):
     print(f"Changes revertidos a {head[:7]}")
 
 
-# --- Log (fase 2) ---
+# --- Log (fase 2; grafo ASCII desde fase 12) ---
 
-def log(repo):
-    """Historial de commits a partir de la rama actual (simplemente ascii)."""
+def log(repo, graph=False):
+    """Historial a partir de la rama actual; con --graph dibuja el grafo."""
     head = commit_head(repo)
     if not head:
         print("No hay commits todavía.")
         return
-    # Ordena por tiempo (heap) y muestra la línea de cada commit
-    shas = []
+
+    if not graph:
+        # Ordena por tiempo (heap) y muestra la línea de cada commit
+        shas = []
+        seen = set()
+        head_obj_type, head_data = read_object(repo, head)
+        timestamp = commit_parse_timestamp(head_data)
+        heapq.heappush(shas, (timestamp, head))
+        while shas:
+            timestamp, sha = heapq.heappop(shas)
+            if sha in seen:
+                continue
+            seen.add(sha)
+            obj_type, data = read_object(repo, sha)
+            lines = data.decode(errors="replace").splitlines()
+            tree = next(l[5:] for l in lines if l.startswith("tree "))
+            parents = [l[7:] for l in lines if l.startswith("parent ")]
+            for parent in parents:
+                if parent not in seen:
+                    heapq.heappush(shas, (commit_parse_timestamp(read_object(repo, parent)[1]), parent))
+            message = lines[lines.index("") + 1:]
+            marker = " Merge:" if len(parents) > 1 else ""
+            print(f"{sha[:7]} (tree {tree[:7]}){marker} {message[0] if message else ''}")
+        return
+
     seen = set()
-    head_obj_type, head_data = read_object(repo, head)
-    timestamp = commit_parse_timestamp(head_data)
-    heapq.heappush(shas, (timestamp, head))
-    while shas:
-        timestamp, sha = heapq.heappop(shas)
-        if sha in seen:
-            continue
-        seen.add(sha)
+
+    def commit_info(sha):
         obj_type, data = read_object(repo, sha)
         lines = data.decode(errors="replace").splitlines()
-        tree = next(l[5:] for l in lines if l.startswith("tree "))
-        parent = next((l[7:] for l in lines if l.startswith("parent ")), None)
-        if parent and parent not in seen:
-            p_type, p_data = read_object(repo, parent)
-            heapq.heappush(shas, (commit_parse_timestamp(p_data), parent))
+        parents = [l[7:] for l in lines if l.startswith("parent ")]
         message = lines[lines.index("") + 1:]
-        print(f"{sha[:7]} (tree {tree[:7]}) {message[0] if message else ''}")
+        return parents, message[0] if message else ""
+
+    drawn = {}
+
+    def emit(msg, col):
+        print(("| " * col) + msg)
+
+    def walk(sha, col):
+        """DFS dibujando el primer padre en la misma columna y los demás
+        en columnas nuevas (forks) que se unen con '|/'."""
+        if sha in drawn:
+            emit("|/", col)
+            return
+        drawn[sha] = col
+        parents, message = commit_info(sha)
+        emit(f"* {sha[:7]} {message}", col)
+        if not parents:
+            return
+        if len(parents) > 1:
+            emit("|\\", col)
+        walk(parents[0], col)
+        for extra_parent in parents[1:]:
+            walk(extra_parent, col + 1)
+
+    walk(head, 0)
 
 
 def commit_parse_timestamp(data):
@@ -1025,6 +1073,33 @@ def commit_parse_timestamp(data):
         if line.startswith("author "):
             return int(line.rsplit(" ", 2)[-2])
     return 0
+
+
+# --- Status --branch (fase 12) ---
+
+def branch_tracking_stats(repo, branch, remote):
+    """adelante/atras entre <branch> local y refs/remotes/<remote>/<branch>."""
+    ref_path = repo_dir(repo, "refs", "remotes", remote, branch)
+    if not os.path.exists(ref_path):
+        return None
+    with open(ref_path) as f:
+        remote_sha = f.read().strip()
+    head = commit_head(repo)
+    if not head:
+        return (0, 0) if not remote_sha else (0, 1)
+
+    def ancestors(sha):
+        result, stack = set(), [sha]
+        while stack:
+            sha = stack.pop()
+            if sha in result or not sha:
+                continue
+            result.add(sha)
+            stack.extend(commit_data_parse(repo, sha)[1])
+        return result
+
+    mine, theirs = ancestors(head), ancestors(remote_sha)
+    return len(mine - theirs), len(theirs - mine)
 
 
 # --- Diff y branch (fase 6) ---
@@ -1143,9 +1218,13 @@ def main(argv=sys.argv[1:]):
     p_commit = sub.add_parser("commit", help="Crea un commit de pygit")
     p_commit.add_argument("-m", "--message", required=True, help="Mensaje del commit")
 
-    sub.add_parser("log", help="Muestra el historial de commits")
+    p_log = sub.add_parser("log", help="Muestra el historial de commits")
+    p_log.add_argument("--graph", action="store_true",
+                       help="Dibuja el grafo ASCII con rombos de merge")
 
-    sub.add_parser("status", help="Archivos añadidos, borrados y modificados")
+    p_status = sub.add_parser("status", help="Archivos añadidos, borrados y modificados")
+    p_status.add_argument("--branch", action="store_true",
+                          help="Incluye adelante/atrás frente al remoto")
 
     p_add = sub.add_parser("add", help="Añade archivos al index (staging)")
     p_add.add_argument("paths", nargs="+", help="Archivos, directorios o '.'")
@@ -1201,7 +1280,7 @@ def main(argv=sys.argv[1:]):
     elif args.command == "commit":
         commit(".", args.message)
     elif args.command == "log":
-        log(".")
+        log(".", graph=args.graph)
     elif args.command == "status":
         staged, unstaged = get_status(".")
 
@@ -1217,6 +1296,21 @@ def main(argv=sys.argv[1:]):
         _section("no preparados (unstaged/untracked)", unstaged)
         if not (any(staged) or any(unstaged)):
             print("Sin cambios.")
+        if args.branch:
+            current = read_ref(".")
+            remotes_dir = repo_dir(".", "refs", "remotes")
+            if os.path.isdir(remotes_dir):
+                for remote in os.listdir(remotes_dir):
+                    stats = branch_tracking_stats(".", current, remote)
+                    if stats is not None:
+                        ahead, behind = stats
+                        tracking = []
+                        if ahead:
+                            tracking.append(f"{ahead} adelante")
+                        if behind:
+                            tracking.append(f"{behind} atrás")
+                        extra = ", ".join(tracking) if tracking else "al día"
+                        print(f"\n'{current}' frente a '{remote}/{current}': {extra}")
 
     elif args.command == "checkout":
         checkout(".", args.branch)
