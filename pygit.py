@@ -8,6 +8,7 @@ Fase 2: commit -> blobs, trees y commits reales (sha1 + zlib)
 """
 
 import argparse
+import difflib
 import hashlib
 import heapq
 import os
@@ -421,6 +422,7 @@ def merge(repo, branch):
     theirs = commit_index(repo, their_head)
 
     changed = False
+    conflicted_paths = []
     for path in set(ancestor) | set(ours) | set(theirs):
         ash = ancestor.get(path)
         bsh = ours.get(path)
@@ -437,14 +439,22 @@ def merge(repo, branch):
         elif ash == csh:               # solo cambia en nuestra rama: vale b
             continue
         else:
-            our_data = read_object(repo, bsh)[1].decode(errors="replace")
-            their_data = read_object(repo, csh)[1].decode(errors="replace")
-            print(f"CONFLICT en {path}")
-            print(f"  nuestro:    {our_data}")
-            print(f"  suyo:       {their_data}")
-            print("  Falta 3-way merge real: aborta")
-            sys.exit(1)
-
+            base_data = ours_data = their_data = None
+            if ash is not None:
+                base_data = read_object(repo, ash)[1]
+            if bsh is not None:
+                ours_data = read_object(repo, bsh)[1]
+            if csh is not None:
+                their_data = read_object(repo, csh)[1]
+            merged, conflicted = merge_content(
+                base_data or b"", ours_data or b"", their_data or b"", branch
+            )
+            # sustituye la entrada por el texto fusionado (con marcadores si hay)
+            ours[path] = write_object(repo, merged, OBJ_BLOB)
+            if conflicted:
+                conflicted_paths.append(path)
+            else:
+                print(f"Auto-merged {path}")
     # Actualiza el working tree con el resultado (archivos de 'ours')
     for path, sha in ours.items():
         dest = os.path.join(repo, path.replace("/", os.sep))
@@ -460,8 +470,16 @@ def merge(repo, branch):
     for path in set(on_disk) - set(ours):
         os.remove(os.path.join(repo, path.replace("/", os.sep)))
 
-    # index = files (staged), luego commit con 2 padres
+    # index = files (staged)
     index_write(repo, ours.items())
+
+    # Si hay conflictos, dejamos los marcadores en el working tree para que el
+    # usuario los resuelva y después haga `pygit commit` manual del merge
+    if conflicted_paths:
+        for path in conflicted_paths:
+            print(f"CONFLICTO en {path}: edita el archivo y resuelve los marcadores")
+        print("ERROR: Conflictos sin resolver; no se crea el commit de merge")
+        sys.exit(1)
 
     timestamp = int(time.time())
     tz = time.strftime("%z")
@@ -480,6 +498,93 @@ def merge(repo, branch):
     print(f"[{our_branch} {sha[:7]}] {message}")
 
 
+
+
+# --- Merge de líneas, 3-way real (fase 5) ---
+
+def sync_regions(base, ours, theirs):
+    """Regiones del base en las que ours y theirs alinean.
+
+    Devuelve (z0, z1, a0, a1, b0, b1): triple rango de líneas alineado.
+    """
+    am = difflib.SequenceMatcher(None, base, ours).get_matching_blocks()
+    bm = difflib.SequenceMatcher(None, base, theirs).get_matching_blocks()
+
+    def intersect(ra, rb):
+        lo, hi = max(ra[0], rb[0]), min(ra[1], rb[1])
+        return (lo, hi) if lo < hi else None
+
+    regions = []
+    ia = ib = 0
+    while ia < len(am) and ib < len(bm):
+        ab, ao, alen = am[ia]
+        bb, bo, blen = bm[ib]
+        overlap = intersect((ab, ab + alen), (bb, bb + blen))
+        if overlap:
+            z0, z1 = overlap
+            length = z1 - z0
+            a0 = ao + (z0 - ab)
+            b0 = bo + (z0 - bb)
+            regions.append((z0, z1, a0, a0 + length, b0, b0 + length))
+        if ab + alen < bb + blen:
+            ia += 1
+        else:
+            ib += 1
+    return regions
+
+
+def merge_content(base_data, ours_data, theirs_data, branch):
+    """Merge de líneas con marcadores de conflicto.
+
+    Devuelve (bytes_resultado, conflicted: bool).
+    """
+    if base_data == ours_data:
+        return theirs_data, False
+    if base_data == theirs_data or ours_data == theirs_data:
+        return ours_data, False
+
+    # splitlines(keepends=True) sobre bytes, evitando la última línea suelta
+    base = base_data.splitlines(keepends=True)
+    ours = ours_data.splitlines(keepends=True)
+    theirs = theirs_data.splitlines(keepends=True)
+    marker_our = b"<<<<<<< HEAD\n"
+    marker_sep = b"=======\n"
+    marker_their = f">>>>>>> {branch}\n".encode()
+
+    regions = sync_regions(base, ours, theirs)
+    result = []
+    conflicted = False
+    iz = ia = ib = 0
+
+    def emit(z0, a0, b0):
+        """Fusión de las líneas previas a la siguiente región estable."""
+        nonlocal iz, ia, ib, conflicted
+        base_lines = base[iz:z0]
+        our_lines = ours[ia:a0]
+        their_lines = theirs[ib:b0]
+        if our_lines == their_lines:      # cambio idéntico en ambas ramas
+            result.extend(our_lines)
+        elif base_lines == our_lines:     # solo cambió la otra rama
+            result.extend(their_lines)
+        elif base_lines == their_lines:   # solo cambió la nuestra
+            result.extend(our_lines)
+        else:
+            conflicted = True
+            result.append(marker_our)
+            result.extend(our_lines)
+            result.append(marker_sep)
+            result.extend(their_lines)
+            result.append(marker_their)
+        iz, ia, ib = z0, a0, b0
+
+    for z0, z1, a0, a1, b0, b1 in regions:
+        emit(z0, a0, b0)
+        iz, ia, ib = z1, a1, b1
+        result.extend(base[z0:z1])
+    # colas restantes al final del archivo
+    emit(len(base), len(ours), len(theirs))
+
+    return b"".join(result), conflicted
 
 
 # --- Log (fase 2) ---
