@@ -101,39 +101,15 @@ def index_read(repo):
     return entries
 
 
-def index_is_dirty(repo):
-    """True si hay archivos añadidos/modificados o borrados que no estén
-    registrados en el index con su sha actual."""
-    current = {}
-    for root, _, filenames in os.walk(repo):
-        if ".git" in root.split(os.sep):
-            continue
-        root_rel = os.path.relpath(root, repo).replace(os.sep, "/")
-        for fn in filenames:
-            path = fn if root_rel == "." else f"{root_rel}/{fn}"
-            with open(os.path.join(root, fn), "rb") as f:
-                data = f.read()
-            current[path] = write_object(repo, data, OBJ_BLOB)
-    indexed = dict(index_read(repo))
-    if set(current) != set(indexed):
-        return True
-    return any(current[p] != indexed[p] for p in current)
-
-
 def commit(repo, message):
-    """Crea blobs para los archivos del index/workdir, un tree y un commit."""
-    # Blobs del working tree (autor ya apareció en write_object vía index)
-    entries = {}
-    for root, _, filenames in os.walk(repo):
-        if ".git" in root.split(os.sep):
-            continue
-        root_rel = os.path.relpath(root, repo).replace(os.sep, "/")
-        for fn in filenames:
-            path = fn if root_rel == "." else f"{root_rel}/{fn}"
-            with open(os.path.join(root, fn), "rb") as f:
-                sha = write_object(repo, f.read(), OBJ_BLOB)
-            entries[path] = sha
-    index_write(repo, entries.items())
+    """Crea el tree desde el index (con 'pygit add' selectivo) y un commit."""
+    entries = dict(index_read(repo))
+    head = commit_head(repo)
+    if not entries:
+        # aborta solo si de verdad no hay nada que commitear
+        if not head or commit_index(repo, head) == {}:
+            print("No hay nada en el index (usa 'pygit add'); aborta commit")
+            sys.exit(1)
 
     # Tree construido recursivamente: los subdirectorios son trees anidados
     tree_sha = build_tree(repo, entries)
@@ -239,37 +215,13 @@ def tree_read(repo, sha):
     return items
 
 
-def get_index_tree(repo):
-    """Devuelve {path: sha} con todos los archivos del tree del commit HEAD."""
-    index = {}
-    if not commit_head(repo):
-        return index
-    _, data = read_object(repo, commit_head(repo))
-    tree_sha = data.split(b"\n")[0].split(b" ")[1].decode()
-
-    def walk(sha, prefix):
-        for mode, obj_type, item_sha, name in tree_read(repo, sha):
-            path = f"{prefix}{name}"
-            if obj_type == OBJ_TREE:
-                walk(item_sha, path + "/")
-            else:
-                index[path] = item_sha
-
-    walk(tree_sha, "")
-    return index
-
-
-# --- Status (fase 3) ---
+# --- Status (fase 3, reescrita en fase 7) ---
 
 def get_status(repo):
-    """Compara HEAD <- pygit-index <- working tree.
+    """Compara HEAD <- index (staged) <- working tree (unstaged).
 
-    Devuelve (add, delete, modified):
-    - add:      en index/HEAD pero no en disco (o viceversa)
-    - delete:   en index pero borrado en disco y sin cambios staged
-    - modified: sha distinto entre disco y lo registrado
+    Devuelve (staged, unstaged) donde cada uno es (add, delete, modified).
     """
-    # sha del disco por archivo
     disk = {}
     for root, dirs, filenames in os.walk(repo):
         dirs[:] = [d for d in dirs if d != ".git"]
@@ -278,13 +230,71 @@ def get_status(repo):
             path = fn if root_rel == "." else f"{root_rel}/{fn}"
             with open(os.path.join(root, fn), "rb") as f:
                 disk[path] = write_object(repo, f.read(), OBJ_BLOB)
-    indexed = dict(index_read(repo))
-    head_tree = get_index_tree(repo)
+    index = dict(index_read(repo))
+    head_tree = commit_index(repo, commit_head(repo))
 
-    add = [p for p in disk if p not in indexed and p not in head_tree]
-    delete = [p for p in indexed if p not in disk and indexed[p] == head_tree.get(p)]
-    modified = [p for p in disk if p in indexed and indexed[p] != disk[p]]
-    return add, delete, modified
+    staged = (
+        [p for p in index if p not in head_tree],                       # added
+        [p for p in head_tree if p not in index],                       # deleted
+        [p for p in index if p in head_tree and index[p] != head_tree[p]],  # modified
+    )
+    unstaged = (
+        [p for p in disk if p not in index],                            # added
+        [p for p in index if p not in disk],                            # deleted
+        [p for p in disk if p in index and disk[p] != index[p]],        # modified
+    )
+    return staged, unstaged
+
+
+# --- Add / rm, staging selectivo (fase 7) ---
+
+def _paths_from_args(repo, paths):
+    """Expande argumentos ('.', archivos o directorios) a rutas relativas."""
+    result = []
+    for arg in paths:
+        norm = os.path.relpath(arg, repo).replace(os.sep, "/")
+        disk = os.path.join(repo, norm.replace("/", os.sep))
+        if os.path.isdir(disk) and not os.path.isfile(disk):
+            for root, dirs, filenames in os.walk(disk):
+                dirs[:] = [d for d in dirs if d != ".git"]
+                root_rel = os.path.relpath(root, repo).replace(os.sep, "/")
+                for fn in filenames:
+                    result.append(fn if root_rel == "." else f"{root_rel}/{fn}")
+        elif norm != ".":
+            result.append(norm)
+        else:
+            result.append(arg.replace(os.sep, "/"))
+    return result
+
+
+def add(repo, paths):
+    """Añade archivos al index (crea el blob de cada uno)."""
+    entries = dict(index_read(repo))
+    for path in _paths_from_args(repo, paths):
+        disk = os.path.join(repo, path.replace("/", os.sep))
+        if not os.path.exists(disk):
+            print(f"ERROR: no existe '{path}' (usa 'rm' para borrar del index)")
+            sys.exit(1)
+        with open(disk, "rb") as f:
+            data = f.read()
+        entries[path] = write_object(repo, data, OBJ_BLOB)
+        print(f"Añadido al index: {path}")
+    index_write(repo, entries.items())
+
+
+def remove(repo, paths):
+    """Borra archivos del working tree y del index (como git rm)."""
+    entries = dict(index_read(repo))
+    for path in _paths_from_args(repo, paths):
+        disk = os.path.join(repo, path.replace("/", os.sep))
+        if path in entries:
+            del entries[path]
+            print(f"Borrado del index: {path}")
+        else:
+            print(f"AVISO: '{path}' no estaba en el index")
+        if os.path.exists(disk):
+            os.remove(disk)
+    index_write(repo, entries.items())
 
 
 # --- Checkout (fase 3) ---
@@ -323,6 +333,9 @@ def checkout(repo, target):
                     f.write(blob)
 
     walk(tree_sha, "", target_files)
+
+    # El index se reinicia al contenido exacto de la rama destino
+    index_write(repo, commit_index(repo, head).items())
 
     # Borra del working tree los archivos que no pertenecen a la rama destino
     removed = []
@@ -477,7 +490,8 @@ def merge(repo, branch):
     # usuario los resuelva y después haga `pygit commit` manual del merge
     if conflicted_paths:
         for path in conflicted_paths:
-            print(f"CONFLICTO en {path}: edita el archivo y resuelve los marcadores")
+            print(f"CONFLICTO en {path}: edita el archivo, ejecuta 'pygit add {path}'")
+            print("y después 'pygit commit -m \"merge tal\"' para completarlo")
         print("ERROR: Conflictos sin resolver; no se crea el commit de merge")
         sys.exit(1)
 
@@ -740,6 +754,12 @@ def main(argv=sys.argv[1:]):
 
     sub.add_parser("status", help="Archivos añadidos, borrados y modificados")
 
+    p_add = sub.add_parser("add", help="Añade archivos al index (staging)")
+    p_add.add_argument("paths", nargs="+", help="Archivos, directorios o '.'")
+
+    p_rm = sub.add_parser("rm", help="Borra del index y del working tree")
+    p_rm.add_argument("paths", nargs="+", help="Archivos o directorios")
+
     p_checkout = sub.add_parser("checkout", help="Cambia de rama (la crea si no existe)")
     p_checkout.add_argument("branch", help="Rama destino")
 
@@ -760,17 +780,27 @@ def main(argv=sys.argv[1:]):
     elif args.command == "log":
         log(".")
     elif args.command == "status":
-        add, delete, modified = get_status(".")
-        for name in add:
-            print(f"added:   {name}")
-        for name in delete:
-            print(f"deleted: {name}")
-        for name in modified:
-            print(f"modified: {name}")
-        if not (add or delete or modified):
+        staged, unstaged = get_status(".")
+
+        def _section(title, triple, verbs=("add", "delete", "modify")):
+            if not any(triple):
+                return
+            print(f"\nCambios {title}:")
+            for verb, names in zip(verbs, triple):
+                for name in names:
+                    print(f"\t{verb}: {name}")
+
+        _section("preparados para el commit (staged)", staged)
+        _section("no preparados (unstaged/untracked)", unstaged)
+        if not (any(staged) or any(unstaged)):
             print("Sin cambios.")
+
     elif args.command == "checkout":
         checkout(".", args.branch)
+    elif args.command == "add":
+        add(".", args.paths)
+    elif args.command == "rm":
+        remove(".", args.paths)
     elif args.command == "merge":
         merge(".", args.branch)
     elif args.command == "diff":
